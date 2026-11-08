@@ -1,6 +1,6 @@
 #include "harness.h"
 
-#include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -12,7 +12,6 @@ DECLARE_PROGRAM(p_timer_irq);
 DECLARE_PROGRAM(p_uart);
 extern const char devices_programs_begin[], devices_programs_finish[];
 
-#define WORK "/Volumes/macOS Storage/husk-work/hengevm"
 #define RAM_SIZE (64ull << 20)
 
 static HvMachine m;
@@ -114,16 +113,35 @@ static void test_gic(void) {
     check("ICENABLER1 clears", (wr32(VMAPPLE_GIC_DIST + 0x184, 6), rd32(VMAPPLE_GIC_DIST + 0x104) & 6), 0);
 }
 
-static int make_disk(const char *path, uint64_t size, uint8_t salt) {
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
+static int make_disk(HvDisk *disk, uint64_t size, uint64_t offset, uint8_t salt) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/henge-test-disk.XXXXXX", tmp) >= (int)sizeof path) {
+        fprintf(stderr, "temporary directory path is too long\n");
+        return -1;
+    }
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+    int result = -1;
     static uint8_t buf[4096];
     for (uint64_t off = 0; off < size; off += sizeof buf) {
         for (size_t i = 0; i < sizeof buf; i++) buf[i] = (uint8_t)((off + i) / 512 * 7 + i + salt);
-        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) return -1;
+        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) {
+            fprintf(stderr, "cannot write test disk %s\n", path);
+            goto cleanup;
+        }
     }
+    result = hv_disk_open(disk, path, offset, 0);
+    if (result != 0) fprintf(stderr, "cannot open test disk %s\n", path);
+cleanup:
+    /* The test only needs the open descriptor from here on. */
+    unlink(path);
     close(fd);
-    return 0;
+    return result;
 }
 
 static void test_simple_devices(void) {
@@ -442,14 +460,13 @@ static void test_guest_programs(void) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
-    const char *root_path = WORK "/test-root.img", *aux_path = WORK "/test-aux.img";
-    if (make_disk(root_path, 1 << 20, 1) || make_disk(aux_path, 256 << 10, 2)) {
-        printf("cannot create test disks in %s\n", WORK);
+    static HvDisk root, aux;
+    if (make_disk(&root, 1 << 20, 0, 1) != 0) return 1;
+    /* As with auxiliary.bin, skip the 16 KB header. */
+    if (make_disk(&aux, 256 << 10, 16384, 2) != 0) {
+        hv_disk_close(&root);
         return 1;
     }
-    static HvDisk root, aux;
-    hv_disk_open(&root, root_path, 0, 0);
-    hv_disk_open(&aux, aux_path, 16384, 0); /* as with auxiliary.bin: skip the 16 KB header */
     HvCfgParams cfg = {.nr_cpus = 1, .ecid = 0x1234, .mac_en0 = {2, 0, 0, 0x12, 0x34, 0x56}};
     static const uint8_t mac[6] = {2, 0, 0, 0x12, 0x34, 0x56};
     if (hv_vmapple_create(&board, &m, &cpu, RAM_SIZE, &root, &aux, &cfg, mac) != 0) return 1;
@@ -481,8 +498,6 @@ int main(void) {
 
     hv_disk_close(&root);
     hv_disk_close(&aux);
-    unlink(root_path);
-    unlink(aux_path);
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }
